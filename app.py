@@ -148,6 +148,7 @@ st.markdown("""
 for key, default in [
     ('authenticated', False), ('current_page', 'About'),
     ('user_data', {}), ('uploaded_df', None), ('predictions', None),
+    ('future_predictions', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -157,6 +158,35 @@ CREDENTIALS = {'Jackline': 'jackline@2026'}
 # Base year used for Year_index during training (min year remaining after
 # the first calendar year, 2018, was dropped for a valid 1-year lag).
 BASE_YEAR = 2019
+
+# Socio-economic long-term driver columns (also used to fit growth trends
+# for the future-year forecasting mode below).
+SOCIO_COLS = ['Population', 'Households', 'Total_Customers',
+              'Service_Line_Connections', 'Cumulative_Connections',
+              'T1_LUKU', 'T2', 'T3']
+
+# Fixed-date Tanzanian public holidays (month, day). Movable holidays that
+# follow the Islamic lunar calendar (Eid al-Fitr, Eid al-Adha, Maulid) and
+# Easter-linked dates (Good Friday, Easter Monday) are not included since
+# they can't be projected onto arbitrary future years without a calendar
+# conversion — treat this as an approximation for future-year forecasts.
+TZ_HOLIDAYS_MMDD = {
+    (1, 1): "New Year's Day", (1, 12): "Zanzibar Revolution Day",
+    (4, 26): "Union Day", (5, 1): "Labour Day", (7, 7): "Saba Saba",
+    (8, 8): "Nane Nane", (10, 14): "Nyerere Day",
+    (12, 9): "Independence Day", (12, 25): "Christmas Day",
+    (12, 26): "Boxing Day",
+}
+
+def get_season(month):
+    """Same Season encoding used in the training data / manual-input form."""
+    if month in (12, 1, 2):
+        return 1  # Hot & Wet
+    if month in (3, 4, 5):
+        return 2  # Long Rains
+    if month in (6, 7, 8):
+        return 3  # Cool & Dry
+    return 4      # Short Rains (9,10,11)
 
 # ════════════════════════════════════════════════════════════════════
 #  MODEL LOADER
@@ -219,6 +249,143 @@ def to_excel_bytes(df):
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df.to_excel(writer, index=False)
     return buf.getvalue()
+
+def run_long_term_forecast(df_hist, target_year, feat_cols, model, metadata,
+                            scaler_X, scaler_y, progress_cb=None):
+    """
+    Recursively forecasts Total_District_MW hour-by-hour from the end of the
+    uploaded historical data through 31 Dec of `target_year`.
+
+    Because the future actual load is unknown, lag/rolling features are
+    computed strictly from prior hours (own predictions once past the
+    historical tail) — unlike the upload-based 'nowcast' tab, which can use
+    the same-hour actual value already present in an uploaded historical file.
+
+    Weather is projected using each (month, hour) climatological average
+    from the uploaded history. Socio-economic drivers (population,
+    customers, connections, etc.) are extrapolated with a simple per-column
+    linear trend fit on historical yearly averages. Holidays beyond the
+    uploaded data use a fixed-date approximation (see TZ_HOLIDAYS_MMDD).
+    """
+    df_hist = df_hist.sort_values('Datetime').reset_index(drop=True)
+    last_dt = df_hist['Datetime'].max()
+    future_start = last_dt + pd.Timedelta(hours=1)
+    future_end = pd.Timestamp(year=int(target_year), month=12, day=31, hour=23)
+    if future_end <= last_dt:
+        raise ValueError("Target year must be after the last date in your "
+                          f"uploaded data ({last_dt.date()}).")
+
+    future_index = pd.date_range(future_start, future_end, freq='h')
+    n_future = len(future_index)
+
+    hist_target = df_hist['Total_District_MW'].to_numpy(dtype=float)
+    hist_len = len(hist_target)
+    combined = np.concatenate([hist_target, np.full(n_future, np.nan)])
+
+    # Weather climatology: mean per (month, hour) across the whole upload.
+    clim = (df_hist.assign(_m=df_hist['Datetime'].dt.month,
+                            _h=df_hist['Datetime'].dt.hour)
+                   .groupby(['_m', '_h'])[['Temperature_C', 'Humidity_pct',
+                                            'Rainfall_mm']]
+                   .mean())
+    overall_weather = df_hist[['Temperature_C', 'Humidity_pct',
+                                'Rainfall_mm']].mean()
+
+    # Linear growth trend per socio-economic column, fit on yearly averages.
+    yearly = (df_hist.assign(_y=df_hist['Datetime'].dt.year)
+                     .groupby('_y')[SOCIO_COLS].mean())
+    trend_coefs = {}
+    for col in SOCIO_COLS:
+        if col in yearly.columns and yearly[col].notna().sum() >= 2:
+            x = yearly.index.values.astype(float)
+            y = yearly[col].values.astype(float)
+            trend_coefs[col] = np.polyfit(x, y, 1)
+        else:
+            trend_coefs[col] = (0.0, df_hist[col].dropna().iloc[-1]
+                                 if col in df_hist.columns else 0.0)
+
+    out_rows = []
+    update_every = max(1, n_future // 100)
+
+    for i, dt in enumerate(future_index):
+        t = hist_len + i
+        hour, dow, month = dt.hour, dt.weekday(), dt.month
+        doy, year = dt.timetuple().tm_yday, dt.year
+        season = get_season(month)
+        is_weekend = 1 if dow >= 5 else 0
+        is_holiday = 1 if (month, dt.day) in TZ_HOLIDAYS_MMDD else 0
+        is_workday = int(not is_weekend and not is_holiday)
+
+        hour_sin, hour_cos = np.sin(2*np.pi*hour/24), np.cos(2*np.pi*hour/24)
+        month_sin, month_cos = np.sin(2*np.pi*month/12), np.cos(2*np.pi*month/12)
+        dow_sin, dow_cos = np.sin(2*np.pi*dow/7), np.cos(2*np.pi*dow/7)
+        doy_sin, doy_cos = np.sin(2*np.pi*doy/365), np.cos(2*np.pi*doy/365)
+        year_index = year - BASE_YEAR
+
+        try:
+            temp, hum, rain = clim.loc[(month, hour)]
+        except KeyError:
+            temp, hum, rain = overall_weather
+        temp_x_hour = temp * hour_sin
+
+        def safe(idx):
+            return combined[idx] if idx >= 0 else np.nan
+
+        lag1, lag2, lag3 = safe(t-1), safe(t-2), safe(t-3)
+        lag24, lag48, lag168 = safe(t-24), safe(t-48), safe(t-168)
+        lag8760 = safe(t-8760)
+        win = lambda k: combined[max(0, t-k):t]
+        roll3  = np.nanmean(win(3))
+        roll6  = np.nanmean(win(6))
+        roll24 = np.nanmean(win(24))
+        roll24std = np.nanstd(win(24), ddof=1) if t >= 2 else 0.0
+        roll8760 = np.nanmean(win(8760))
+
+        frac_year = year + (doy - 1) / 365.0
+        socio_vals = {c: trend_coefs[c][0]*frac_year + trend_coefs[c][1]
+                      for c in SOCIO_COLS}
+
+        feat_row = {
+            'Hour_of_Day': hour, 'Day_of_Week': dow, 'Month': month,
+            'Season': season, 'Is_Weekend': is_weekend,
+            'Is_Holiday': is_holiday, 'Is_Workday': is_workday,
+            'Hour_sin': hour_sin, 'Hour_cos': hour_cos,
+            'Month_sin': month_sin, 'Month_cos': month_cos,
+            'DOW_sin': dow_sin, 'DOW_cos': dow_cos,
+            'DOY_sin': doy_sin, 'DOY_cos': doy_cos,
+            'Year_index': year_index,
+            'Temperature_C': temp, 'Humidity_pct': hum, 'Rainfall_mm': rain,
+            'Temp_x_Hour': temp_x_hour,
+            'Total_District_MW_lag1h': lag1, 'Total_District_MW_lag2h': lag2,
+            'Total_District_MW_lag3h': lag3, 'Total_District_MW_lag24h': lag24,
+            'Total_District_MW_lag48h': lag48,
+            'Total_District_MW_lag168h': lag168,
+            'Total_District_MW_roll3h_mean': roll3,
+            'Total_District_MW_roll6h_mean': roll6,
+            'Total_District_MW_roll24h_mean': roll24,
+            'Total_District_MW_roll24h_std': roll24std,
+            'Total_District_MW_lag8760h': lag8760,
+            'Total_District_MW_roll8760h_mean': roll8760,
+            **socio_vals,
+        }
+
+        X_row = np.nan_to_num(
+            np.array([[feat_row.get(c, 0.0) for c in feat_cols]], dtype=float),
+            nan=0.0)
+        pred = float(make_prediction(model, X_row, metadata,
+                                      scaler_y, scaler_X)[0])
+        combined[t] = pred
+
+        row_out = {'Datetime': dt, 'Predicted_Total_District_MW': round(pred, 3)}
+        row_out.update({k: v for k, v in feat_row.items()
+                         if k in ('Temperature_C', 'Humidity_pct', 'Rainfall_mm',
+                                  'Is_Weekend', 'Is_Holiday', 'Season')})
+        out_rows.append(row_out)
+
+        if progress_cb and (i % update_every == 0 or i == n_future - 1):
+            progress_cb((i + 1) / n_future)
+
+    return pd.DataFrame(out_rows)
 
 # Shared dark-theme layout for all Plotly charts
 DARK_CHART = dict(
@@ -441,6 +608,8 @@ def page_prediction():
             st.info("Please upload a data file in the Registration & Upload page first.")
         else:
             df = st.session_state.uploaded_df.copy()
+            if 'Datetime' in df.columns:
+                df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce')
             missing_cols = [c for c in feat_cols if c not in df.columns]
 
             c1, c2, c3 = st.columns(3)
@@ -459,42 +628,140 @@ def page_prediction():
             if missing_cols:
                 st.error(f"Cannot predict — missing columns: {missing_cols}")
             else:
-                X = df[feat_cols].fillna(method='ffill').fillna(0).values
-                if st.button("▶  Run Prediction", key="run_pred"):
-                    with st.spinner("Running forecast..."):
-                        try:
-                            preds  = make_prediction(model, X, metadata,
-                                                     scaler_y, scaler_X)
-                            offset = len(df) - len(preds)
-                            result_df = df.iloc[offset:].reset_index(drop=True)
-                            result_df['Predicted_Total_District_MW'] = preds.round(3)
-                            st.session_state.predictions = result_df
-                            st.success(f"Forecast complete — "
-                                       f"{len(preds):,} predictions generated.")
-                        except Exception as e:
-                            st.error(f"Prediction error: {e}")
+                mode = st.radio(
+                    "Choose what to do with the uploaded data:",
+                    ["📌 Predict on Uploaded Data",
+                     "🔮 Forecast Future Years (2030, 2050, ...)"],
+                    horizontal=True, key="upload_mode",
+                )
 
-                if st.session_state.predictions is not None:
-                    res = st.session_state.predictions
-                    st.markdown("### 📋 Prediction Results")
-                    display_cols = [c for c in
-                        ['Datetime','Hour_of_Day','Day_of_Week','Month',
-                         'Temperature_C','Humidity_pct','Total_District_MW',
-                         'Predicted_Total_District_MW'] if c in res.columns]
-                    st.dataframe(res[display_cols].head(50),
-                                 use_container_width=True)
-                    d1, d2 = st.columns(2)
-                    with d1:
-                        st.download_button("Download CSV",
-                            data=res.to_csv(index=False).encode(),
-                            file_name="ilala_forecasting_results.csv",
-                            mime="text/csv")
-                    with d2:
-                        st.download_button("Download Excel",
-                            data=to_excel_bytes(res),
-                            file_name="ilala_forecasting_results.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument"
-                                 ".spreadsheetml.sheet")
+                # ---- Mode A: predict on the rows already in the file ----
+                if mode == "📌 Predict on Uploaded Data":
+                    X = df[feat_cols].ffill().fillna(0).values
+                    if st.button("▶  Run Prediction", key="run_pred"):
+                        with st.spinner("Running forecast..."):
+                            try:
+                                preds  = make_prediction(model, X, metadata,
+                                                         scaler_y, scaler_X)
+                                offset = len(df) - len(preds)
+                                result_df = df.iloc[offset:].reset_index(drop=True)
+                                result_df['Predicted_Total_District_MW'] = preds.round(3)
+                                st.session_state.predictions = result_df
+                                st.success(f"Forecast complete — "
+                                           f"{len(preds):,} predictions generated.")
+                            except Exception as e:
+                                st.error(f"Prediction error: {e}")
+
+                    if st.session_state.predictions is not None:
+                        res = st.session_state.predictions
+                        st.markdown("### 📋 Prediction Results")
+                        display_cols = [c for c in
+                            ['Datetime','Hour_of_Day','Day_of_Week','Month',
+                             'Temperature_C','Humidity_pct','Total_District_MW',
+                             'Predicted_Total_District_MW'] if c in res.columns]
+                        st.dataframe(res[display_cols].head(50),
+                                     use_container_width=True)
+                        d1, d2 = st.columns(2)
+                        with d1:
+                            st.download_button("Download CSV",
+                                data=res.to_csv(index=False).encode(),
+                                file_name="ilala_forecasting_results.csv",
+                                mime="text/csv")
+                        with d2:
+                            st.download_button("Download Excel",
+                                data=to_excel_bytes(res),
+                                file_name="ilala_forecasting_results.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument"
+                                     ".spreadsheetml.sheet")
+
+                # ---- Mode B: extend the upload into a future-year forecast ----
+                else:
+                    required_for_forecast = ['Datetime', 'Total_District_MW']
+                    missing_req = [c for c in required_for_forecast
+                                   if c not in df.columns or df[c].isna().all()]
+                    if missing_req:
+                        st.error("Future-year forecasting needs a valid "
+                                 f"{', '.join(required_for_forecast)} column "
+                                 f"in your upload. Missing/empty: {missing_req}")
+                    else:
+                        last_dt = df['Datetime'].max()
+
+                        preset = st.radio("Quick presets", ["2030", "2040", "2050", "Custom"],
+                                           horizontal=True, key="year_preset")
+                        if preset == "Custom":
+                            target_year = st.number_input(
+                                "Target year", min_value=last_dt.year + 1,
+                                max_value=2100, value=min(2035, 2100), step=1)
+                        else:
+                            target_year = int(preset)
+
+                        n_est_hours = max(0, int((pd.Timestamp(target_year, 12, 31, 23)
+                                                   - last_dt).total_seconds() // 3600))
+
+                        if target_year <= last_dt.year:
+                            st.warning("Target year must be after the last year "
+                                       "in your uploaded data.")
+                        elif st.button(f"🚀  Run Long-Term Forecast to {target_year}",
+                                       key="run_future_forecast"):
+                            progress_bar = st.progress(0.0)
+                            status_text = st.empty()
+                            def _cb(frac):
+                                progress_bar.progress(min(1.0, frac))
+                                status_text.text(f"Forecasting... {frac*100:,.0f}%")
+                            try:
+                                with st.spinner("Running long-term forecast — "
+                                                 "this may take a little while for "
+                                                 "distant target years..."):
+                                    future_df = run_long_term_forecast(
+                                        df, target_year, feat_cols, model,
+                                        metadata, scaler_X, scaler_y,
+                                        progress_cb=_cb)
+                                progress_bar.empty()
+                                status_text.empty()
+                                st.session_state.future_predictions = future_df
+                                st.success(f"Long-term forecast complete — "
+                                           f"{len(future_df):,} hourly predictions "
+                                           f"generated through {target_year}.")
+                            except Exception as e:
+                                progress_bar.empty()
+                                status_text.empty()
+                                st.error(f"Forecast error: {e}")
+
+                        if st.session_state.future_predictions is not None:
+                            fut = st.session_state.future_predictions
+                            st.markdown("### 📈 Future Forecast Results")
+
+                            fig = go.Figure()
+                            hist_tail = df.sort_values('Datetime').tail(24*30)
+                            fig.add_trace(go.Scatter(
+                                x=hist_tail['Datetime'], y=hist_tail['Total_District_MW'],
+                                mode='lines', name='Historical (last 30 days)',
+                                line=dict(color='#4DA3FF')))
+                            fig.add_trace(go.Scatter(
+                                x=fut['Datetime'], y=fut['Predicted_Total_District_MW'],
+                                mode='lines', name=f'Forecast to {target_year}',
+                                line=dict(color='#F5B041')))
+                            fig.update_layout(**DARK_CHART, height=420,
+                                title="Historical Tail vs. Long-Term Forecast",
+                                legend=dict(orientation='h', y=1.1))
+                            st.plotly_chart(dark_axes(fig), use_container_width=True)
+
+                            st.dataframe(
+                                fut[['Datetime', 'Predicted_Total_District_MW']].head(50),
+                                use_container_width=True)
+
+                            d1, d2 = st.columns(2)
+                            with d1:
+                                st.download_button("Download CSV",
+                                    data=fut.to_csv(index=False).encode(),
+                                    file_name=f"ilala_forecast_to_{target_year}.csv",
+                                    mime="text/csv")
+                            with d2:
+                                st.download_button("Download Excel",
+                                    data=to_excel_bytes(fut),
+                                    file_name=f"ilala_forecast_to_{target_year}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument"
+                                         ".spreadsheetml.sheet")
 
     # ── TAB 2: Manual input — arranged in clear sections ─────────
     with tab2:
@@ -524,9 +791,18 @@ def page_prediction():
         with t4:
             holiday = st.selectbox("Is Holiday", [0, 1],
                         format_func=lambda x: "Yes" if x else "No")
-            year = st.number_input("Year (for long-term trend)", 2019, 2035, 2025, 1)
+            year = st.number_input("Year (for long-term trend)", 2019, 2100, 2025, 1)
             st.caption("Sin/cos encodings, Is_Workday and Temp_x_Hour "
                        "are computed automatically.")
+            if year > 2025:
+                st.warning(
+                    f"⚠ {year} is beyond the training data (2018–2025). "
+                    "XGBoost is tree-based and doesn't extrapolate trends the way "
+                    "a linear model would — for a meaningful long-term projection, "
+                    "also increase Population, Households, Total Customers and "
+                    "Connections below to values consistent with that future year.",
+                    icon="⚠️"
+                )
 
         # SECTION 2 — Weather
         st.markdown('<div class="group-title">🌡 SECTION 2 — Weather Conditions</div>',
@@ -575,21 +851,23 @@ def page_prediction():
                     'Socio-Economic Drivers</div>', unsafe_allow_html=True)
         st.caption("Population, connections and customer growth — the key "
                    "long-term factors identified in Objective 1.")
+        st.caption("Ranges are widened beyond the historical dataset so you can "
+                   "model longer-term growth scenarios (e.g. 2030, 2050).")
         se1, se2, se3 = st.columns(3)
         with se1:
-            population = st.number_input("Population", 1_600_000, 2_500_000, 1_800_000, 1000)
-            households = st.number_input("Households", 400_000, 700_000, 500_000, 500)
+            population = st.number_input("Population", 1_600_000, 10_000_000, 1_800_000, 1000)
+            households = st.number_input("Households", 400_000, 3_000_000, 500_000, 500)
         with se2:
-            total_customers = st.number_input("Total Customers", 300_000, 500_000, 355_000, 100)
-            service_conn    = st.number_input("New Service Connections (this year)", 1_000, 60_000, 30_000, 100)
+            total_customers = st.number_input("Total Customers", 300_000, 2_000_000, 355_000, 100)
+            service_conn    = st.number_input("New Service Connections (this year)", 1_000, 300_000, 30_000, 100)
         with se3:
-            cumulative_conn = st.number_input("Cumulative Connections (since 2018)", 5_000, 250_000, 100_000, 500)
-            t1_luku = st.number_input("T1 (Residential LUKU) Customers", 300_000, 400_000, 350_000, 100)
+            cumulative_conn = st.number_input("Cumulative Connections (since 2018)", 5_000, 5_000_000, 100_000, 500)
+            t1_luku = st.number_input("T1 (Residential LUKU) Customers", 300_000, 2_000_000, 350_000, 100)
         se4, se5 = st.columns(2)
         with se4:
-            t2 = st.number_input("T2 (Commercial) Customers", 500, 800, 615, 1)
+            t2 = st.number_input("T2 (Commercial) Customers", 500, 5_000, 615, 1)
         with se5:
-            t3 = st.number_input("T3 (Industrial) Customers", 100, 250, 165, 1)
+            t3 = st.number_input("T3 (Industrial) Customers", 100, 2_000, 165, 1)
 
         # PREDICT button — centred
         st.markdown("<br>", unsafe_allow_html=True)
